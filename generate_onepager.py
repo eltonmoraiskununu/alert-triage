@@ -111,7 +111,7 @@ def generate(path="AlertTriage_OnePager.pdf"):
     CX_R = M + COL_W_L + GAP
 
     CONTENT_TOP = H - HDR_H - 5 * mm   # ~700 pt
-    FOOTER_H = 8 * mm
+    FOOTER_H = 11 * mm
     ARCH_H = 27 * mm
     ARCH_Y = FOOTER_H + FOOTER_H + ARCH_H  # bottom of arch section
     CONTENT_BOT = FOOTER_H + ARCH_H + 6 * mm  # ~120 pt
@@ -399,11 +399,12 @@ def generate(path="AlertTriage_OnePager.pdf"):
 
     c.setFillColor(PALE_GREY)
     c.setFont("Helvetica", 7)
-    c.drawString(M, 3 * mm,
+    c.drawString(M, 4.5 * mm,
                  "Python  |  aiohttp  |  Bot Framework SDK v4  |  Google Gemini gemini-3.1-flash-lite  "
                  "|  New Relic NerdGraph EU  |  Microsoft Teams")
     c.setFillColor(NR_GREEN)
-    c.drawRightString(W - M, 3 * mm, "github.com/your-org/alert-triage")
+    c.setFont("Helvetica", 7)
+    c.drawString(M, 1 * mm, "github.com/eltonmoraiskununu/alert-triage")
 
     c.save()
     print(f"Saved: {path}")
