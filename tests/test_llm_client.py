@@ -1,11 +1,11 @@
 from unittest.mock import patch
 import pytest
 
-from ai.gemini_client import extract_service_context, synthesize_triage
+from ai.llm_client import extract_service_context, synthesize_triage
 
 
 def _mock_generate(text: str):
-    return patch("ai.gemini_client._generate", return_value=text)
+    return patch("ai.llm_client._generate", return_value=text)
 
 
 def test_extract_service_context_valid_json():

@@ -3,7 +3,7 @@ import logging
 from botbuilder.core import ActivityHandler, TurnContext
 from botbuilder.schema import Activity, ActivityTypes
 
-from ai.gemini_client import extract_service_context, synthesize_triage, synthesize_investigation
+from ai.llm_client import extract_service_context, synthesize_triage, synthesize_investigation
 from newrelic.client import get_service_triage_data, get_investigation_data
 from bot.adaptive_card import build_triage_card
 from bot.alert_parser import parse_alert_message

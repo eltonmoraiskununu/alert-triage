@@ -1,11 +1,9 @@
 import json
-import re
 import time
 import logging
 from datetime import date
-from google import genai
-from google.genai.errors import ClientError
-from config.settings import GEMINI_API_KEY
+import anthropic
+from config.settings import ANTHROPIC_API_KEY
 from ai.prompts import (
     EXTRACT_SERVICE_PROMPT,
     TRIAGE_SYNTHESIS_PROMPT_APM,
@@ -16,34 +14,54 @@ from ai.prompts import (
 
 logger = logging.getLogger(__name__)
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
-_MODEL = "gemini-3.1-flash-lite-preview"
+_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+_MODEL = "claude-3-5-haiku-20241022"
 
 _MAX_RETRIES = 3
 _DEFAULT_RETRY_DELAY = 30
 
 
-def _parse_retry_delay(error: ClientError) -> float:
-    match = re.search(r"retryDelay.*?(\d+)s", str(error))
-    if match:
-        return float(match.group(1))
-    return _DEFAULT_RETRY_DELAY
-
-
 def _generate(prompt: str) -> str:
+    """Send a prompt to Claude and return the text response, with retry on overload."""
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            response = _client.models.generate_content(model=_MODEL, contents=prompt)
-            return response.text.strip()
-        except ClientError as e:
-            if e.status_code == 429 and attempt < _MAX_RETRIES:
-                delay = _parse_retry_delay(e)
+            message = _client.messages.create(
+                model=_MODEL,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return message.content[0].text.strip()
+        except anthropic.RateLimitError as e:
+            if attempt < _MAX_RETRIES:
                 logger.warning(
-                    "Gemini rate limited (attempt %d/%d). Retrying in %.0fs…",
-                    attempt, _MAX_RETRIES, delay,
+                    "Anthropic rate limited (attempt %d/%d). Retrying in %ds…",
+                    attempt, _MAX_RETRIES, _DEFAULT_RETRY_DELAY,
                 )
-                time.sleep(delay)
+                time.sleep(_DEFAULT_RETRY_DELAY)
             else:
+                raise RuntimeError(
+                    "Anthropic API rate limit exceeded. Please try again later."
+                ) from e
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529 and attempt < _MAX_RETRIES:
+                # 529 = Anthropic overloaded
+                logger.warning(
+                    "Anthropic API overloaded (attempt %d/%d). Retrying in %ds…",
+                    attempt, _MAX_RETRIES, _DEFAULT_RETRY_DELAY,
+                )
+                time.sleep(_DEFAULT_RETRY_DELAY)
+            elif e.status_code == 401:
+                raise RuntimeError(
+                    "Anthropic API key is invalid or missing. "
+                    "Please check your ANTHROPIC_API_KEY in the .env file."
+                ) from e
+            elif e.status_code == 403:
+                raise RuntimeError(
+                    "Anthropic API key does not have permission for this operation. "
+                    "Please verify your ANTHROPIC_API_KEY has the correct access."
+                ) from e
+            else:
+                logger.error("Anthropic API error (HTTP %s): %s", e.status_code, e)
                 raise
 
 
