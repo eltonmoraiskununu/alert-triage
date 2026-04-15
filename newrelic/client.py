@@ -3,6 +3,7 @@ import logging
 import re
 import requests
 from config.settings import NR_API_KEY, NR_ACCOUNT_ID, NR_NERDGRAPH_URL
+from newrelic.sanitize import nrql_string, nrql_timestamp, nrql_trace_id, entity_search_string
 
 logger = logging.getLogger(__name__)
 from newrelic.queries import (
@@ -127,13 +128,19 @@ def _find_entity(service_name: str, entity_type_hint: str | None = None) -> dict
     words = stripped.split()
     fuzzy = "%" + "%".join(words) + "%" if words else f"%{stripped}%"
 
+    # Sanitize all string values before interpolation into entitySearch query strings.
+    # NerdGraph entitySearch uses single-quote delimiters — same escaping as NRQL.
+    safe_name = entity_search_string(service_name)
+    safe_stripped = entity_search_string(stripped)
+    safe_fuzzy = entity_search_string(fuzzy)
+
     candidates = [
-        f"name = '{service_name}' AND {types}",
-        f"name LIKE '%{service_name}%' AND {types}",
+        f"name = '{safe_name}' AND {types}",
+        f"name LIKE '%{safe_name}%' AND {types}",
     ]
     if stripped != service_name:
-        candidates.append(f"name LIKE '%{stripped}%' AND {types}")
-    candidates.append(f"name LIKE '{fuzzy}' AND {types}")
+        candidates.append(f"name LIKE '%{safe_stripped}%' AND {types}")
+    candidates.append(f"name LIKE '{safe_fuzzy}' AND {types}")
 
     # If we have a type hint, try progressively shorter fuzzy patterns
     # before falling back to all types. This handles cases where the AI
@@ -141,14 +148,14 @@ def _find_entity(service_name: str, entity_type_hint: str | None = None) -> dict
     # monitor is actually called "Culture MMI Page is Down").
     if hint_types and len(words) > 1:
         for n in range(len(words) - 1, 0, -1):
-            shorter = "%" + "%".join(words[:n]) + "%"
+            shorter = entity_search_string("%" + "%".join(words[:n]) + "%")
             candidates.append(f"name LIKE '{shorter}' AND {hint_types}")
 
     # If we had a type hint, also try without it as fallback
     if hint_types:
-        candidates.append(f"name LIKE '{fuzzy}' AND {all_types}")
+        candidates.append(f"name LIKE '{safe_fuzzy}' AND {all_types}")
     # Last resort: no type filter
-    candidates.append(f"name LIKE '{fuzzy}'")
+    candidates.append(f"name LIKE '{safe_fuzzy}'")
 
     for query in candidates:
         logger.info("Entity search: %s", query)
@@ -193,8 +200,9 @@ def _pick_best_entity(entities: list[dict], search_name: str) -> dict:
 # ── Triage fetchers ─────────────────────────────────────────
 
 def _fetch_apm(name: str, entity: dict) -> dict:
-    burn_results = _run_nrql(APM_BURN_RATE_NRQL.format(name=name))
-    error_results = _run_nrql(APM_ERRORS_NRQL.format(name=name))
+    safe_name = nrql_string(name)
+    burn_results = _run_nrql(APM_BURN_RATE_NRQL.format(name=safe_name))
+    error_results = _run_nrql(APM_ERRORS_NRQL.format(name=safe_name))
     return {
         "entity_type": "APM",
         "service_name": name,
@@ -209,8 +217,9 @@ def _fetch_apm(name: str, entity: dict) -> dict:
 
 
 def _fetch_synthetic(name: str, entity: dict) -> dict:
-    stats_results = _run_nrql(SYNTHETIC_STATS_NRQL.format(name=name))
-    loc_results = _run_nrql(SYNTHETIC_LOCATIONS_NRQL.format(name=name))
+    safe_name = nrql_string(name)
+    stats_results = _run_nrql(SYNTHETIC_STATS_NRQL.format(name=safe_name))
+    loc_results = _run_nrql(SYNTHETIC_LOCATIONS_NRQL.format(name=safe_name))
 
     stats = stats_results[0] if stats_results else {}
     failing_locations = [r.get("facet") for r in loc_results if r.get("facet")]
@@ -232,7 +241,7 @@ def _fetch_service_level(name: str, entity: dict) -> dict:
     guid = entity["guid"]
     tags = _tags_to_dict(entity.get("tags", []))
 
-    results = _run_nrql(SL_COMPLIANCE_NRQL.format(guid=guid))
+    results = _run_nrql(SL_COMPLIANCE_NRQL.format(guid=nrql_string(guid)))
     row = results[0] if results else {}
     current_compliance = row.get("current_compliance")
 
@@ -428,7 +437,17 @@ def _query_logs_by_traces(trace_ids: list[str], start: str, end: str) -> list[di
     """Query Log events correlated to the given traceIds."""
     if not trace_ids:
         return []
-    ids_str = ", ".join(f"'{t}'" for t in trace_ids)
+    # Validate each trace ID before embedding in the IN() clause.
+    # nrql_trace_id() raises ValueError on unexpected characters; skip bad IDs.
+    safe_ids = []
+    for t in trace_ids:
+        try:
+            safe_ids.append(nrql_trace_id(t))
+        except ValueError:
+            logger.warning("Skipping invalid trace ID: %r", t)
+    if not safe_ids:
+        return []
+    ids_str = ", ".join(f"'{t}'" for t in safe_ids)
     nrql = (
         f"SELECT timestamp, message, level, error.message, error.class, "
         f"httpResponseCode, request.uri "
@@ -476,8 +495,10 @@ def get_investigation_data(service_name: str, time_start: str, time_end: str, en
     guid = entity["guid"]
     entity_name = entity.get("name", service_name)
 
-    nrql_start = time_start.replace("T", " ").replace("Z", "")
-    nrql_end = time_end.replace("T", " ").replace("Z", "")
+    # Validate and sanitize timestamps before any NRQL interpolation.
+    # nrql_timestamp() raises ValueError on malformed input.
+    nrql_start = nrql_timestamp(time_start.replace("T", " ").replace("Z", ""))
+    nrql_end = nrql_timestamp(time_end.replace("T", " ").replace("Z", ""))
 
     # Route to entity-type-specific investigation
     if entity_type == "SYNTHETIC":
@@ -506,24 +527,28 @@ def get_investigation_data(service_name: str, time_start: str, time_end: str, en
         entity_type, sli_kind, app_name, time_start, time_end,
     )
 
+    # Sanitize entity/app names before any NRQL interpolation
+    safe_service = nrql_string(service_name)
+    safe_app = nrql_string(app_name)
+
     # 1. Alert incidents
     alert_incidents = _safe_nrql(
         INVESTIGATION_ALERTS_NRQL.format(
-            entity_name=service_name, start=nrql_start, end=nrql_end,
+            entity_name=safe_service, start=nrql_start, end=nrql_end,
         )
     )
 
     # 2. Deployments
     deployments = _safe_nrql(
         INVESTIGATION_DEPLOYMENTS_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 3. JS errors (relevant for browser-based SLIs)
     js_errors = _safe_nrql(
         INVESTIGATION_JS_ERRORS_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
@@ -536,48 +561,48 @@ def get_investigation_data(service_name: str, time_start: str, time_end: str, en
         cwv_section_title = "LCP (Largest Contentful Paint) — Page Breakdown"
         cwv_data = _safe_nrql(
             INVESTIGATION_LCP_DETAIL_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
         cwv_detail = _safe_nrql(
             INVESTIGATION_LCP_ELEMENTS_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
     elif sli_kind == "inp":
         cwv_section_title = "INP (Interaction to Next Paint) — Page Breakdown"
         cwv_data = _safe_nrql(
             INVESTIGATION_INP_DETAIL_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
         cwv_detail = _safe_nrql(
             INVESTIGATION_INP_INTERACTIONS_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
     elif sli_kind == "cls":
         cwv_section_title = "CLS (Cumulative Layout Shift) — Page Breakdown"
         cwv_data = _safe_nrql(
             INVESTIGATION_CLS_DETAIL_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
         cwv_detail = _safe_nrql(
             INVESTIGATION_CLS_WORST_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
     elif sli_kind in ("latency", "availability", "success", "error"):
         cwv_section_title = "APM Transaction Data"
         cwv_data = _safe_nrql(
             INVESTIGATION_APM_SLOW_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
         cwv_detail = _safe_nrql(
             INVESTIGATION_APM_ERRORS_NRQL.format(
-                app_name=app_name, start=nrql_start, end=nrql_end,
+                app_name=safe_app, start=nrql_start, end=nrql_end,
             )
         )
     else:
@@ -638,6 +663,7 @@ def _investigate_synthetic(
 ) -> dict:
     """Collect investigation evidence for a Synthetic Monitor."""
     monitor_name = entity_name
+    safe_monitor = nrql_string(monitor_name)
 
     logger.info(
         "Synthetic investigation: monitor=%s, window=%s → %s",
@@ -647,42 +673,42 @@ def _investigate_synthetic(
     # 1. Alert incidents
     alert_incidents = _safe_nrql(
         INVESTIGATION_ALERTS_NRQL.format(
-            entity_name=monitor_name, start=nrql_start, end=nrql_end,
+            entity_name=safe_monitor, start=nrql_start, end=nrql_end,
         )
     )
 
     # 2. Overall stats for the window
     stats = _safe_nrql(
         INVESTIGATION_SYNTHETIC_STATS_NRQL.format(
-            name=monitor_name, start=nrql_start, end=nrql_end,
+            name=safe_monitor, start=nrql_start, end=nrql_end,
         )
     )
 
     # 3. Failure breakdown by location
     locations = _safe_nrql(
         INVESTIGATION_SYNTHETIC_LOCATIONS_NRQL.format(
-            name=monitor_name, start=nrql_start, end=nrql_end,
+            name=safe_monitor, start=nrql_start, end=nrql_end,
         )
     )
 
     # 4. Timeseries — failure pattern over the window
     timeseries = _safe_nrql(
         INVESTIGATION_SYNTHETIC_TIMESERIES_NRQL.format(
-            name=monitor_name, start=nrql_start, end=nrql_end,
+            name=safe_monitor, start=nrql_start, end=nrql_end,
         )
     )
 
     # 5. Individual failure details (error messages, response codes)
     failures = _safe_nrql(
         INVESTIGATION_SYNTHETIC_FAILURES_NRQL.format(
-            name=monitor_name, start=nrql_start, end=nrql_end,
+            name=safe_monitor, start=nrql_start, end=nrql_end,
         )
     )
 
     # 6. Failed HTTP requests from SyntheticRequest (for scripted monitors)
     failed_requests = _safe_nrql(
         INVESTIGATION_SYNTHETIC_REQUESTS_NRQL.format(
-            name=monitor_name, start=nrql_start, end=nrql_end,
+            name=safe_monitor, start=nrql_start, end=nrql_end,
         )
     )
 
@@ -720,6 +746,7 @@ def _investigate_apm(
 ) -> dict:
     """Collect investigation evidence for an APM application."""
     app_name = entity_name
+    safe_app = nrql_string(app_name)
 
     logger.info(
         "APM investigation: app=%s, window=%s → %s",
@@ -729,63 +756,63 @@ def _investigate_apm(
     # 1. Alert incidents
     alert_incidents = _safe_nrql(
         INVESTIGATION_ALERTS_NRQL.format(
-            entity_name=app_name, start=nrql_start, end=nrql_end,
+            entity_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 2. Overview stats (error rate, avg/p95 duration, throughput)
     overview = _safe_nrql(
         INVESTIGATION_APM_OVERVIEW_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 3. Slowest transactions
     slow_transactions = _safe_nrql(
         INVESTIGATION_APM_SLOW_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 4. Error breakdown by transaction and class
     errors = _safe_nrql(
         INVESTIGATION_APM_ERRORS_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 5. Timeseries — error and latency pattern over the window
     timeseries = _safe_nrql(
         INVESTIGATION_APM_TIMESERIES_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 6. Throughput timeseries (RPM)
     throughput = _safe_nrql(
         INVESTIGATION_APM_THROUGHPUT_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 7. External service calls (slow dependencies)
     externals = _safe_nrql(
         INVESTIGATION_APM_EXTERNAL_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 8. Individual error traces with traceId
     error_traces = _safe_nrql(
         INVESTIGATION_APM_ERROR_TRACES_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
     # 9. Deployments in the window
     deployments = _safe_nrql(
         INVESTIGATION_DEPLOYMENTS_NRQL.format(
-            app_name=app_name, start=nrql_start, end=nrql_end,
+            app_name=safe_app, start=nrql_start, end=nrql_end,
         )
     )
 
